@@ -1,38 +1,182 @@
-/**********************************************************************/
-/* UDF that implements a simplified advective term in the */
-/* scalar transport equation */
-/**********************************************************************/
 #include "udf.h"
-DEFINE_UDS_FLUX(my_uds_flux, f, t, i)
+
+#define WALLSIDE1 4
+#define WALLSIDE2 9
+
+#define UDM_NEIGHBOUR_C    0
+#define UDM_NEIGHBOUR_TC   1
+#define UDM_MASS_SOURCE    2
+
+#define TOLERANCE 1E-10
+
+#define SPECIES_NUMBER 0
+
+#define PERMISSIVITY 1.0e-2
+
+#define MY_PRINT Message
+
+/* User-Defined Functions for a membrane
+ * permeable to one species but not to fluid
+ * in general.  The membrane is represented
+ * by a wall (with facezone numbers WALLSIDE1
+ * and WALLSIDE2 for the wall and its shadow),
+ * and the mass transfer is brought about by
+ * source terms in the neighbouring cells.
+ *
+ * Written by James Tibbetts and Ed Wynn,
+ * Fluent Europe, January 2006. */
+
+DEFINE_INIT(init_function,d)
 {
-	cell_t c0, c1 = -1;
-	Thread *t0, *t1 = NULL;
-	real NV_VEC(psi_vec), NV_VEC(A), flux = 0.0;
-	c0 = F_C0(f, t);
-	t0 = F_C0_THREAD(f, t);
-	F_AREA(A, f, t);
-	/* If face lies at domain boundary, use face values; */
-	/* If face lies IN the domain, use average of adjacent cells. */
-	if (BOUNDARY_FACE_THREAD_P(t)) /*Most face values will be available*/
-	{
-		real dens;
-		/* Depending on its BC, density may not be set on face thread*/
-		if (NNULLP(THREAD_STORAGE(t, SV_DENSITY)))
-			dens = F_R(f, t); /* Set dens to face value if available */
-		else
-			dens = C_R(c0, t0); /* else, set dens to cell value */
-		NV_DS(psi_vec, =, F_U(f, t), F_V(f, t), F_W(f, t), *, dens);
-		flux = NV_DOT(psi_vec, A); /* flux through Face */
-	}
-	else
-	{
-		c1 = F_C1(f, t); /* Get cell on other side of face */
-		t1 = F_C1_THREAD(f, t);
-		NV_DS(psi_vec, =, C_U(c0, t0), C_V(c0, t0), C_W(c0, t0), *, C_R(c0, t0));
-		NV_DS(psi_vec, +=, C_U(c1, t1), C_V(c1, t1), C_W(c1, t1), *, C_R(c1, t1));
-		flux = NV_DOT(psi_vec, A) / 2.0; /* Average flux through face */
-	}
-	/* ANSYS Fluent will multiply the returned value by phi_f (the scalar’s
-	value at the face) to get the ‘‘complete’’ advective term. */
-	return flux;
+
+  Thread *tc1, *tc2;
+  Thread *tf1, *tf2;
+  cell_t c1, c2;
+  face_t f1, f2;
+  real   f_c1[3], f_c2[3];
+
+/*
+  This routine is run on initialisation.  It sets the User-Defined
+  Memory to appropriate values and initialises the species values
+  for the entire domain.  Also, for the two wall face-zones WALLSIDE1
+  and WALLSIDE2 (one of which is the shadow of the other), it works 
+  out pairs of cells on either side of each face.
+*/
+  
+/* Here is the initialisation of the UDM & species: */
+  thread_loop_c(tc1,d)
+  {
+      begin_c_loop(c1,tc1)
+      {
+	    C_UDMI(c1,tc1,UDM_NEIGHBOUR_C)    = 0.0;
+	    C_UDMI(c1,tc1,UDM_NEIGHBOUR_TC)   = 0.0;
+	    C_UDMI(c1,tc1,UDM_MASS_SOURCE)    = 0.0;
+      }
+      end_c_loop(c1,tc1)
+  }
+	      
+/* Here is the pairing of cells: */
+  
+/* First, find the threads of the two wall face-zones: */
+  tf1 = Lookup_Thread(d,WALLSIDE1);
+  tf2 = Lookup_Thread(d,WALLSIDE2);
+
+/* Loop through all faces on one of the face-zones: */  
+  begin_f_loop(f1,tf1)
+  {
+      /* Find the centroid of this face: */
+      F_CENTROID(f_c1,f1,tf1);
+
+      /* Find the cell linked to this face: */
+      c1 = F_C0(f1,tf1);
+      tc1 = THREAD_T0(tf1);
+
+      /* Loop through all faces of the other face-zone: */
+      begin_f_loop(f2,tf2)
+      {
+	/* Find the face with the same centroid, to within
+	   TOLERANCE.  TOLERANCE should therefore be a distance
+	   smaller than the size of a cell (but not too much 
+	   smaller, to avoid missed pairings due to round-off). */
+	F_CENTROID(f_c2,f2,tf2);
+	    if (fabs(f_c1[0]-f_c2[0]) <= TOLERANCE &&
+	        fabs(f_c1[1]-f_c2[1]) <= TOLERANCE &&
+	        fabs(f_c1[2]-f_c2[2]) <= TOLERANCE ) 
+            {
+                /* Having found the matching face, find its cell: */
+		c2 = F_C0(f2,tf2);
+                tc2 = THREAD_T0(tf2);
+
+		/* Note each cell's partner in the User-Defined Memory.
+		   UDMs must record real values -- add 0.1 so that an
+		   integer is not recorded as x.9999999 as the nearest
+		   real. */
+                C_UDMI(c1,tc1,UDM_NEIGHBOUR_C) = c2 + 0.1;
+                C_UDMI(c2,tc2,UDM_NEIGHBOUR_C) = c1 + 0.1;
+                C_UDMI(c1,tc1,UDM_NEIGHBOUR_TC) = THREAD_ID(tc2) + 0.1;
+                C_UDMI(c2,tc2,UDM_NEIGHBOUR_TC) = THREAD_ID(tc1) + 0.1;
+	    }
+      }
+      end_f_loop(f2,tf2)
+  }
+  end_f_loop(f1,tf1)
+  MY_PRINT("\n Membrane initialisation completed.\n");
+}
+
+
+DEFINE_SOURCE(source_mass,c,t,ds,eqn)
+{
+/* This source term should be applied to the entire
+ * fluid zone (because it is zero where not needed),
+ * as both a mass source and a species source.  */
+  ds[eqn] = 0.;
+  return C_UDMI(c,t,UDM_MASS_SOURCE);
+}
+
+DEFINE_ADJUST(adjust_sources, d)
+{
+  Thread *tc1, *tc2;
+  Thread *tf1;
+  cell_t c1, c2;
+  face_t f1;
+  real mass_flux, face_area, face_area_vector[3];
+  real massfrac1, cell_volume1;
+  real massfrac2, cell_volume2;
+
+/* This must be hooked into the ADJUST hook, so that the
+ * source terms are updated on each iteration.  The source
+ * terms are stored in User-Defined Memory. */
+
+  /* Loop through all faces on the connecting wall that
+   * represents the membrane.  (Either the wall or the wall
+   * shadow, it doesn't matter which.) */
+  tf1 = Lookup_Thread(d,WALLSIDE1);
+  
+  begin_f_loop(f1,tf1)
+  {
+
+      F_AREA(face_area_vector,f1,tf1);
+      face_area = NV_MAG(face_area_vector);
+      
+      c1 = F_C0(f1,tf1);
+      tc1 = THREAD_T0(tf1);
+      cell_volume1 = C_VOLUME(c1,tc1);
+
+      /* The cell on the other side of the membrane has been
+       * stored in UDM by the initialisation function: */
+      c2  = (int)C_UDMI(c1,tc1,UDM_NEIGHBOUR_C);
+      tc2 = Lookup_Thread(d, (int)C_UDMI(c1,tc1,UDM_NEIGHBOUR_TC));
+      cell_volume2 = C_VOLUME(c2,tc2);
+
+      massfrac1 = C_YI(c1,tc1,SPECIES_NUMBER);
+      massfrac2 = C_YI(c2,tc2,SPECIES_NUMBER);
+
+      /* This is the assumed law for rate of transfer of the species
+       * across the membrane: */
+      mass_flux = face_area * PERMISSIVITY * (massfrac1 - massfrac2);
+/*      [kg/s]     [m2]         [kg/m2/s]         [dimensionless]      */
+
+      /* To achieve this rate of mass transfer (for this cell face), there 
+       * are corresponding source terms in the cells on either side.  These
+       * source terms are expressed per unit volume of fluid in the cells: */
+      C_UDMI(c1,tc1,UDM_MASS_SOURCE) = -mass_flux / cell_volume1;
+      C_UDMI(c2,tc2,UDM_MASS_SOURCE) = +mass_flux / cell_volume2;
+  }
+  end_f_loop(f1,tf1)
+
+}
+
+DEFINE_PROFILE(pressure_profile,t,i)
+{
+  real x[ND_ND];                /* this will hold the position vector */
+  real y;
+  face_t f;
+
+  begin_f_loop(f,t)
+    {
+      F_CENTROID(x,f,t);
+      y = x[1];
+      F_PROFILE(f,t,i) = 1.1e5 - y*y/(.0745*.0745)*0.1e5;
+    }
+  end_f_loop(f,t)
 }
